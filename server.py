@@ -5,7 +5,7 @@ import sqlite3
 from PIL import Image
 import pytesseract
 
-app = Flask(**name**)
+app = Flask(__name__)
 
 # ============ Cấu hình cho Render Free ============
 
