@@ -7,13 +7,13 @@ import pytesseract
 
 app = Flask(**name**)
 
-# ============ Cấu hình nhẹ cho Render Free ============
+# ============ Cấu hình cho Render Free ============
 
 UPLOAD_FOLDER = "/tmp/uploads"
 DATABASE = "/tmp/smartgarage.db"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ============ Khởi tạo DB ============
+# ============ Kết nối & khởi tạo DB ============
 
 def get_db_connection():
 conn = sqlite3.connect(DATABASE, check_same_thread=False)
@@ -55,29 +55,36 @@ c.execute('''
 ''')
 conn.commit()
 
-# Nếu DB trống, thêm sẵn 1 xe demo
+# Nếu DB trống, thêm sẵn danh sách 5 xe trong nhà
 c.execute("SELECT COUNT(*) FROM vehicles")
 if c.fetchone()[0] == 0:
-    c.execute("INSERT INTO vehicles (plate, owner) VALUES (?,?)", ("ABC123", "DemoUser"))
+    vehicles = [
+        ("36A66666", "Thanh"),
+        ("60B27272", "Vinh"),
+        ("48C48484", "Tien"),
+        ("62D62626", "Quoc"),
+        ("69E69696", "Long")
+    ]
+    c.executemany("INSERT INTO vehicles (plate, owner) VALUES (?,?)", vehicles)
     conn.commit()
 
 conn.close()
 ```
 
-# ============ OCR (dùng pytesseract, cực nhẹ) ============
+# ============ OCR bằng pytesseract ============
 
 def ocr_image(filepath):
 img = Image.open(filepath)
 text = pytesseract.image_to_string(img, lang='eng')
 return text.strip()
 
-# ============ API ============
+# ============ API chính ============
 
 @app.route('/')
 def index():
 return "✅ SmartGarage Flask (Render Free Edition) is running!"
 
-# ESP upload ảnh để quét biển số
+# ESP upload ảnh biển số để nhận diện
 
 @app.route('/api/esp/upload', methods=['POST'])
 def esp_upload():
@@ -97,7 +104,7 @@ return jsonify({"status": "error", "message": "Missing esp_id"}), 400
 
     ocr_text = ocr_image(filepath)
     plate_detected = "".join(ocr_text.split()).upper()
-    os.remove(filepath)  # Xóa ảnh để tiết kiệm RAM/disk
+    os.remove(filepath)  # xóa ảnh sau khi xử lý để tiết kiệm dung lượng
 
     conn = get_db_connection()
     c = conn.cursor()
@@ -105,26 +112,53 @@ return jsonify({"status": "error", "message": "Missing esp_id"}), 400
     matched_row = c.fetchone()
     matched = 1 if matched_row else 0
 
+    # ⚠️ Không lưu lịch sử ra/vào ở đây — chỉ lưu sau khi App xác nhận
     c.execute("INSERT INTO events (esp_id, plate, ocr_text, matched, note, ts) VALUES (?,?,?,?,?,?)",
-              (esp_id, plate_detected, ocr_text, matched, "OCR processed", datetime.now().isoformat()))
+              (esp_id, plate_detected, ocr_text, matched, "OCR processed (waiting for app confirm)", datetime.now().isoformat()))
     conn.commit()
-
-    resp = {"status": "success", "esp_id": esp_id, "plate_text": plate_detected, "matched": bool(matched)}
-
-    if matched:
-        c.execute("INSERT INTO commands (esp_id, command, plate, status, created_at) VALUES (?,?,?,?,?)",
-                  (esp_id, "OPEN", plate_detected, "pending", datetime.now().isoformat()))
-        conn.commit()
-        resp["command_created"] = "OPEN"
-
     conn.close()
-    return jsonify(resp)
 
+    return jsonify({
+        "status": "success",
+        "esp_id": esp_id,
+        "plate_text": plate_detected,
+        "matched": bool(matched),
+        "message": "OCR done, waiting for app confirmation"
+    })
 except Exception as e:
     return jsonify({"status": "error", "message": str(e)}), 500
 ```
 
-# ESP poll lệnh
+# App xác nhận mở cửa
+
+@app.route('/api/app/confirm_open', methods=['POST'])
+def app_confirm_open():
+data = request.get_json() or {}
+esp_id = data.get("esp_id")
+plate = (data.get("plate") or "").upper()
+approved = data.get("approved", False)
+
+```
+if not esp_id or not plate:
+    return jsonify({"status": "error", "message": "esp_id và plate required"}), 400
+
+conn = get_db_connection()
+c = conn.cursor()
+
+if approved:
+    # Lưu lịch sử ra/vào khi App xác nhận
+    c.execute("INSERT INTO events (esp_id, plate, ocr_text, matched, note, ts) VALUES (?,?,?,?,?,?)",
+              (esp_id, plate, None, 1, "App confirmed open → Door opened", datetime.now().isoformat()))
+    # Gửi lệnh mở cho ESP
+    c.execute("INSERT INTO commands (esp_id, command, plate, status, created_at) VALUES (?,?,?,?,?)",
+              (esp_id, "OPEN", plate, "pending", datetime.now().isoformat()))
+    conn.commit()
+
+conn.close()
+return jsonify({"status": "ok", "approved": approved})
+```
+
+# ESP lấy lệnh từ server
 
 @app.route('/api/esp/poll', methods=['GET'])
 def esp_poll():
@@ -147,7 +181,7 @@ conn.close()
 return jsonify({"status": "ok", "command": cmd["command"], "plate": cmd["plate"], "cmd_id": cmd["id"]})
 ```
 
-# ESP báo trạng thái thực thi
+# ESP gửi kết quả thực thi
 
 @app.route('/api/esp/status', methods=['POST'])
 def esp_status():
@@ -163,7 +197,6 @@ if not (esp_id and cmd_id and result):
 conn = get_db_connection()
 c = conn.cursor()
 c.execute("UPDATE commands SET status=? WHERE id=? AND esp_id=?", (result, cmd_id, esp_id))
-conn.commit()
 c.execute("INSERT INTO events (esp_id, plate, ocr_text, matched, note, ts) VALUES (?,?,?,?,?,?)",
           (esp_id, None, None, 0, f"cmd_status:{result}", datetime.now().isoformat()))
 conn.commit()
@@ -171,29 +204,7 @@ conn.close()
 return jsonify({"status": "ok"})
 ```
 
-# App Android gửi lệnh thủ công
-
-@app.route('/api/app/command', methods=['POST'])
-def app_command():
-data = request.get_json() or {}
-esp_id = data.get("esp_id")
-command = (data.get("command") or "").upper()
-plate = data.get("plate")
-
-```
-if not (esp_id and command):
-    return jsonify({"status": "error", "message": "esp_id và command required"}), 400
-
-conn = get_db_connection()
-c = conn.cursor()
-c.execute("INSERT INTO commands (esp_id, command, plate, status, created_at) VALUES (?,?,?,?,?)",
-          (esp_id, command, plate, "pending", datetime.now().isoformat()))
-conn.commit()
-conn.close()
-return jsonify({"status": "ok", "message": "Command queued"})
-```
-
-# Quản lý xe nhà
+# App thêm xe mới
 
 @app.route('/api/vehicles/add', methods=['POST'])
 def add_vehicle():
@@ -215,34 +226,7 @@ except sqlite3.IntegrityError:
     return jsonify({"status": "error", "message": "Plate already exists"}), 400
 ```
 
-# App xác nhận mở cửa (ghi lịch sử vào DB)
-
-@app.route('/api/app/confirm_open', methods=['POST'])
-def app_confirm_open():
-data = request.get_json() or {}
-esp_id = data.get("esp_id")
-plate = (data.get("plate") or "").upper()
-approved = data.get("approved", False)
-
-```
-if not esp_id or not plate:
-    return jsonify({"status": "error", "message": "esp_id và plate required"}), 400
-
-conn = get_db_connection()
-c = conn.cursor()
-
-if approved:
-    c.execute("INSERT INTO events (esp_id, plate, ocr_text, matched, note, ts) VALUES (?,?,?,?,?,?)",
-              (esp_id, plate, None, 1, "App confirmed open", datetime.now().isoformat()))
-    c.execute("INSERT INTO commands (esp_id, command, plate, status, created_at) VALUES (?,?,?,?,?)",
-              (esp_id, "OPEN", plate, "pending", datetime.now().isoformat()))
-    conn.commit()
-
-conn.close()
-return jsonify({"status": "ok", "approved": approved})
-```
-
-# Xem log lịch sử ra/vào
+# Xem lịch sử ra/vào
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
